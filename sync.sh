@@ -55,6 +55,30 @@ echo ""
 echo "Resetting main to upstream..."
 git reset --hard tip/objtool/core
 
+# Changes to the kernel itself cannot live in linux/: the reset above throws
+# away anything that is not upstream.  Anything the CI needs from the tree --
+# a test fix that has not landed yet, say -- is carried here as a patch and
+# reapplied on each sync, and disappears from here once upstream has it.
+#
+# A patch that stops applying is the signal that this happened, or that
+# upstream moved under it; either way it wants a person, so stop rather than
+# push a tree with half of it applied.
+shopt -s nullglob
+patches=( "$CI_FILES_DIR"/patches/*.patch )
+shopt -u nullglob
+
+if (( ${#patches[@]} )); then
+    echo "Applying ${#patches[@]} patch(es) from patches/..."
+    if ! git am "${patches[@]}"; then
+        git am --abort || true
+        echo ""
+        echo "Error: patches do not apply to $UPSTREAM_SHA."
+        echo "Either upstream has moved, or upstream already carries the change"
+        echo "-- in which case drop the patch from ci_files/patches/."
+        exit 1
+    fi
+fi
+
 echo "Copying CI files from ci_files..."
 # Copy .github and ci directories, removing any that were deleted in ci_files
 rsync -a --delete "$CI_FILES_DIR/.github" "$LINUX_ABS/"
@@ -63,7 +87,7 @@ if [[ -d "$CI_FILES_DIR/ci" ]]; then
 fi
 
 echo "Staging CI files for commit..."
-git add .github
+git add -f .github
 if [[ -d "$LINUX_ABS/ci" ]]; then
     git add ci
 fi

@@ -1,0 +1,151 @@
+From 7b513b56275f6df7c50c1e1ced07258e611797ef Mon Sep 17 00:00:00 2001
+From: Song Liu <song@kernel.org>
+Date: Tue, 22 Sep 2026 15:11:24 -0700
+Subject: [PATCH 2/2] objtool/klp: Add test for ENDBR from a widened linkage
+
+Dropping "static" is not free under IBT.  The compiler gives an
+externally visible function an ENDBR64 landing pad that the static one
+did not need, so a patch which only widens the linkage still moves the
+function's instructions and klp diff carries it into the patch.
+
+That is the wanted answer rather than a wart to normalise away.  A patch
+which promotes a function usually does so because something is about to
+take its address, and an indirect call has to land on an ENDBR; the
+kernel's copy is the one without the pad, so reusing it would #CP on CET
+hardware.  The extra clone costs a few bytes, skipping it costs a fault.
+
+Cover both halves of that: the promoted function is cloned, pad and all,
+and grew by exactly the four bytes of an ENDBR64; a function whose
+linkage and body both stay put keeps its checksum even though it carries
+a pad on both sides, so the pad itself is not what makes the other one
+differ.  Check too that correlation is not what the pad disturbs -- the
+symbols still pair, one of them simply compares unequal afterwards.
+
+The flag is spelled out rather than inherited, so this runs the same way
+on a toolchain that defaults CET off as on one that defaults it on.
+---
+ .../objtool/tests/x86/fixtures/ibt_linkage.c  | 44 ++++++++++++++
+ .../tests/x86/test-ibt-linkage-flip.sh        | 60 +++++++++++++++++++
+ 2 files changed, 104 insertions(+)
+ create mode 100644 tools/objtool/tests/x86/fixtures/ibt_linkage.c
+ create mode 100755 tools/objtool/tests/x86/test-ibt-linkage-flip.sh
+
+diff --git a/tools/objtool/tests/x86/fixtures/ibt_linkage.c b/tools/objtool/tests/x86/fixtures/ibt_linkage.c
+new file mode 100644
+index 000000000000..1a66df0477db
+--- /dev/null
++++ b/tools/objtool/tests/x86/fixtures/ibt_linkage.c
+@@ -0,0 +1,44 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * IBT and the instruction checksum.
++ *
++ * Under -fcf-protection=branch the compiler opens every function it cannot
++ * prove is reached only by direct calls with an ENDBR64 landing pad.  A static
++ * function whose address is never taken needs none; giving the same function
++ * external linkage makes it a possible indirect target, so it gains four
++ * bytes.
++ *
++ * "promoted" therefore has different instructions in the two builds even
++ * though its source body is untouched, while "stable" keeps its landing pad on
++ * both sides and must checksum the same.
++ */
++
++static const char __modinfo[]
++	__attribute__((section(".modinfo"), used, aligned(1))) = "\0name=vmlinux";
++
++/* noinline, or these are folded into the caller and have no symbol */
++
++/* Static in the original, external in the patch: ENDBR appears. */
++#ifdef PATCHED
++__attribute__((noinline)) int promoted(int x)
++#else
++__attribute__((noinline)) static int promoted(int x)
++#endif
++{
++	return x + 1;
++}
++
++/* External on both sides, body untouched: ENDBR on both, checksum stable. */
++__attribute__((noinline)) int stable(int x)
++{
++	return x + 2;
++}
++
++int caller(int x)
++{
++#ifdef PATCHED
++	return promoted(x) + stable(x) + 1;
++#else
++	return promoted(x) + stable(x);
++#endif
++}
+diff --git a/tools/objtool/tests/x86/test-ibt-linkage-flip.sh b/tools/objtool/tests/x86/test-ibt-linkage-flip.sh
+new file mode 100755
+index 000000000000..38419ab4c1dd
+--- /dev/null
++++ b/tools/objtool/tests/x86/test-ibt-linkage-flip.sh
+@@ -0,0 +1,60 @@
++#!/bin/bash
++# SPDX-License-Identifier: GPL-2.0
++#
++# Dropping "static" is not a free change under IBT.  The compiler gives an
++# externally visible function an ENDBR64 landing pad that the static one did
++# not need, so a patch which only widens the linkage still moves the
++# function's instructions, and klp diff carries it into the patch.
++#
++# That is the wanted answer, not a wart to be normalised away.  A patch which
++# promotes a function usually does so because something is about to take its
++# address, and the address it will be called through has to land on an ENDBR.
++# The kernel's copy is the one without the pad, so on CET hardware reusing it
++# would #CP.  The extra clone costs a few bytes; skipping it costs a fault.
++#
++# What must not follow from the linkage change is a second copy of the data --
++# see test-local-to-global-flip, which makes the same point with IBT out of
++# the picture.  Here the point is that IBT does not break that part.
++
++. "$(dirname "$0")/../lib.sh"
++
++setup
++require_cf_protection branch
++build_pair ibt_linkage.c -fcf-protection=branch
++
++# The premise: the compiler did what this test is about.  A toolchain which
++# emits pads by some other rule leaves nothing here to measure.
++has_endbr orig.o promoted &&
++	probe_skip "compiler pads the static function too"
++has_endbr patched.o promoted ||
++	probe_skip "compiler did not pad the promoted function"
++
++run_diff
++
++assert_diff_log 'changed function: promoted'
++assert_diff_log 'changed function: caller'
++
++# The pad is a real instruction change, so the promoted function is cloned
++# with it.
++assert_patched promoted
++
++# The landing pad is the whole of that change: four bytes of ENDBR64 in front
++# of the same body.
++grew=$(( $(sym_size patched.o promoted) - $(sym_size orig.o promoted) ))
++[ "$grew" = 4 ] ||
++	fail "promoted grew by $grew bytes, expected the 4 of an ENDBR64"
++has_endbr out.o promoted ||
++	fail "the cloned promoted() lost its landing pad"
++
++# Correlation is not what the pad disturbs.  Both symbols pair with their
++# counterparts; one of them simply compares unequal afterwards.
++diff_log | grep -q 'no correlation' &&
++	fail "linkage change under IBT reported as an uncorrelated symbol"
++
++# A function whose linkage and body both stay put keeps its checksum even
++# though it carries a pad on both sides: the pad itself is not what makes
++# promoted() differ.
++assert_not_patched stable
++assert_klp_sym stable vmlinux
++
++pass "ENDBR from a widened linkage is a change, and only that function's"
+-- 
+2.53.0-Meta
+
