@@ -6,32 +6,119 @@ on:
   pull_request:
     branches: [main]
 
+# Two jobs rather than two steps: the objtool tests do not consume the kernel
+# build.  objtool is a host tool and the tests compile their own fixtures, so
+# sequencing them would only mean a broken kernel build costs the test results
+# as well -- twenty-five minutes to learn nothing.  Run them side by side and
+# each reports on its own.
+#
+# Both matrices are a list of names; setup-toolchain turns a name into
+# packages and make arguments, so the two cannot disagree about what "gcc-11"
+# means.
+
 jobs:
-  build-and-test:
+  objtool-tests:
+    name: tests ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
+      # One toolchain failing is a result about that toolchain, not a reason
+      # to cancel the others.
+      fail-fast: false
       matrix:
-        toolchain: [gcc, clang]
+        name: [gcc-11, gcc-13, clang-18]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - id: tc
+        uses: ./.github/actions/setup-toolchain
+        with:
+          name: ${{ matrix.name }}
+
+      - name: Run objtool tests
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential flex bison bc libssl-dev libelf-dev clang llvm
+          set -o pipefail   # the status must come from make, not from tee
+          make -C tools/objtool ${{ steps.tc.outputs.make_args }} tests 2>&1 | tee test.log
+
+      # The failure this guards against is silent: select the compiler the
+      # wrong way and every entry builds with the runner's default, so a green
+      # matrix means one toolchain tested over and over.  The preflight banner
+      # records what was actually used; hold it to what was asked for.
+      - name: Check the tests used the matrix compiler
+        if: always()
+        run: |
+          want='${{ steps.tc.outputs.major }}'
+          got=$(sed -n 's/^#   compiler  //p' test.log)
+          echo "fixtures compiled with: $got"
+          case "$got" in
+          *\ "$want".*) ;;
+          *) echo "::error::fixtures built with '$got', expected major $want"; exit 1 ;;
+          esac
+
+      - name: Collect failure artifacts
+        if: failure()
+        run: |
+          mkdir -p artifacts
+          # The per-test working directories -- fixtures, out.o and diff.log
+          # for whichever test failed.  These can be fed straight back into a
+          # local "objtool klp diff", which is what makes a CI-only failure
+          # debuggable without a runner.
+          cp -r /tmp/klp-tests.* artifacts/ 2>/dev/null || true
+          cp tools/objtool/objtool artifacts/objtool 2>/dev/null || true
+          cp test.log artifacts/ 2>/dev/null || true
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: objtool-test-artifacts-${{ matrix.name }}
+          path: artifacts/
+          retention-days: 7
+
+  kernel-build:
+    name: kernel ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        name: [gcc-11, gcc-13, clang-18]
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: tc
+        uses: ./.github/actions/setup-toolchain
+        with:
+          name: ${{ matrix.name }}
 
       - name: Cache kernel build output
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
-          path: build-${{ matrix.toolchain }}
-          key: kbuild-${{ runner.os }}-${{ matrix.toolchain }}-${{ github.sha }}
+          path: build-${{ matrix.name }}
+          key: kbuild-${{ runner.os }}-${{ matrix.name }}-${{ github.sha }}
           restore-keys: |
-            kbuild-${{ runner.os }}-${{ matrix.toolchain }}-
+            kbuild-${{ runner.os }}-${{ matrix.name }}-
 
       - name: Build kernel
         run: |
-          CC=${{ matrix.toolchain }} make O=build-${{ matrix.toolchain }} defconfig
-          CC=${{ matrix.toolchain }} make O=build-${{ matrix.toolchain }} -j$(nproc)
+          make O=build-${{ matrix.name }} ${{ steps.tc.outputs.make_args }} defconfig
+          make O=build-${{ matrix.name }} ${{ steps.tc.outputs.make_args }} -j"$(nproc)"
 
-      - name: Run objtool tests
-        run: CC=${{ matrix.toolchain }} make -C tools/objtool tests -j$(nproc)
+      - name: Check the kernel used the matrix compiler
+        run: |
+          want='${{ steps.tc.outputs.major }}'
+          cfg=build-${{ matrix.name }}/.config
+          sed -n 's/^CONFIG_CC_VERSION_TEXT=//p' "$cfg"
+          # CONFIG_{GCC,CLANG}_VERSION is major*10000 + minor*100 + patch, and
+          # whichever compiler is not in use reports 0.
+          got=$(sed -n 's/^CONFIG_\(GCC\|CLANG\)_VERSION=\([0-9]\+\)$/\2/p' "$cfg" |
+                sort -rn | head -1)
+          [ "$((got / 10000))" = "$want" ] ||
+            { echo "::error::kernel built with major $((got / 10000)), expected $want"; exit 1; }
+
+      - name: Upload kernel config on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config-${{ matrix.name }}
+          path: build-${{ matrix.name }}/.config
+          retention-days: 7
+          if-no-files-found: ignore

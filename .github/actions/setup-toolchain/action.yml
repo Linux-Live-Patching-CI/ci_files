@@ -1,0 +1,96 @@
+name: Set up a kernel build toolchain
+description: >
+  Install the compiler a matrix entry names and report how to ask make for it.
+  Entries are named <compiler>-<major>, and everything else about them --
+  which packages, which make arguments -- follows from that, so a job's matrix
+  stays a list of names and the two jobs cannot drift apart.
+
+inputs:
+  name:
+    description: 'Toolchain to install: gcc-<major> or clang-<major>'
+    required: true
+
+outputs:
+  make_args:
+    description: >
+      The make argument selecting this toolchain.  Pass it as an argument, not
+      through the environment: the kernel's Makefile assigns CC itself and a
+      makefile assignment beats the environment, so an exported CC is ignored
+      and the build quietly uses the runner's default compiler.
+    value: ${{ steps.resolve.outputs.make_args }}
+  major:
+    description: The major version, for a job checking it got the compiler it asked for.
+    value: ${{ steps.resolve.outputs.major }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      run: |
+        set -eu
+        name='${{ inputs.name }}'
+        major=${name##*-}
+        case "$name" in
+        gcc-*)
+          packages="gcc-$major"
+          # LLVM=-<major> is the kernel's spelling for a versioned LLVM
+          # toolchain; gcc has no equivalent, so name the compiler directly.
+          make_args="CC=gcc-$major"
+          ;;
+        clang-*)
+          packages="clang-$major lld-$major llvm-$major"
+          # Picks up ld.lld, llvm-objcopy and llvm-readelf of the same version,
+          # which the objtool tests use as well as the kernel build.
+          make_args="LLVM=-$major"
+          ;;
+        *)
+          echo "::error::unrecognised toolchain '$name'"; exit 1 ;;
+        esac
+        {
+          echo "major=$major"
+          echo "packages=$packages"
+          echo "make_args=$make_args"
+        } >> "$GITHUB_OUTPUT"
+
+    - shell: bash
+      run: |
+        set -eu
+        sudo apt-get update
+        # libxxhash-dev is the one that is easy to miss: without it objtool
+        # still builds, and then every test bails with "objtool was built
+        # without klp support".
+        sudo apt-get install -y build-essential flex bison bc \
+                                libssl-dev libelf-dev libxxhash-dev
+
+    - shell: bash
+      run: |
+        set -eu
+        packages='${{ steps.resolve.outputs.packages }}'
+
+        # Every toolchain in the matrix comes from the distribution.  A version
+        # the archive does not carry would need apt.llvm.org's llvm.sh, which
+        # installs the signing key -- adding that repository by hand leaves apt
+        # rejecting it as unsigned.
+        #
+        # Check first, and ask the question apt-get will ask.  "Can this be
+        # installed?" is not "does apt know the name?": apt-cache show succeeds
+        # for a package apt has merely heard of and would let the step run on
+        # to fail with "Package 'clang-N' has no installation candidate".
+        # policy prints "Candidate: (none)" for that case, and nothing at all
+        # for a name apt has never seen.
+        missing=
+        for p in $packages; do
+          apt-cache policy "$p" 2>/dev/null | grep -q 'Candidate: [^(]' ||
+            missing="$missing $p"
+        done
+        if [ -n "$missing" ]; then
+          for p in $missing; do
+            echo "--- apt-cache policy $p ---"; apt-cache policy "$p" || true
+          done
+          echo "::error::${{ inputs.name }}: no installation candidate for:$missing"
+          echo "::error::not in the ubuntu-$(lsb_release -rs 2>/dev/null) archive; it would need apt.llvm.org"
+          exit 1
+        fi
+
+        sudo apt-get install -y $packages
