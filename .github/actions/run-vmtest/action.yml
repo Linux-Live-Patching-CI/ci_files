@@ -1,0 +1,71 @@
+name: Run a command in a VM
+description: >
+  Boot a kernel under vmtest and run one command in it.  The VM runs on the
+  runner's own root filesystem, shared read-write over 9p, so the command sees
+  the workspace -- it starts in the current directory -- and anything it
+  writes there is on the runner afterwards.  The step's status is the
+  command's exit status; vmtest itself failing, or the kernel panicking, exits
+  69.
+
+inputs:
+  kernel:
+    description: Path to the kernel image to boot (bzImage)
+    required: true
+  command:
+    description: Command to run in the VM, as root
+    required: true
+  vmtest-version:
+    description: Release of danobi/vmtest to use
+    default: v0.18.0
+
+runs:
+  using: composite
+  steps:
+    - name: Install vmtest and QEMU
+      shell: bash
+      env:
+        VERSION: ${{ inputs.vmtest-version }}
+      run: |
+        set -eu
+        sudo curl -fsSL --retry 3 -o /usr/local/bin/vmtest \
+          "https://github.com/danobi/vmtest/releases/download/$VERSION/vmtest-x86_64"
+        sudo chmod 755 /usr/local/bin/vmtest
+        sudo apt-get update
+        # vmtest runs the host's qemu-ga inside the guest to execute the
+        # command, so the guest agent is a host package here.
+        sudo apt-get install -y --no-install-recommends \
+                                qemu-system-x86 qemu-guest-agent
+
+    # vmtest uses KVM when /dev/kvm exists and quietly falls back to emulation
+    # when it does not.  Emulation is many times slower, and the tests give up
+    # on a livepatch transition after a fixed minute, so a run there would
+    # fail at random rather than say KVM is gone.  Make the device usable, and
+    # refuse to go on without it.
+    - name: Check that KVM is usable
+      shell: bash
+      run: |
+        set -eu
+        if [ -e /dev/kvm ] && [ ! -w /dev/kvm ]; then
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+        fi
+        if [ ! -w /dev/kvm ]; then
+          ls -l /dev/kvm || true
+          echo "::error::/dev/kvm is missing or not writable; the VM would run without KVM"
+          exit 1
+        fi
+
+    - name: Run the command in the VM
+      shell: bash
+      env:
+        KERNEL: ${{ inputs.kernel }}
+        COMMAND: ${{ inputs.command }}
+      run: |
+        # oops=panic: an oops otherwise kills only the task that hit it, and
+        # the kernel limps on underneath whatever runs next.  vmtest already
+        # passes panic=-1 and runs qemu with -no-reboot, so a panic ends the
+        # VM and fails the step.
+        vmtest --kernel "$KERNEL" --kargs "oops=panic" "$COMMAND"

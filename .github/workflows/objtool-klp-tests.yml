@@ -74,51 +74,15 @@ jobs:
           path: artifacts/
           retention-days: 7
 
-  kernel-build:
+  # Builds a kernel configured for livepatch -- so with CONFIG_KLP_BUILD,
+  # which a defconfig build never had -- then boots it and runs the
+  # livepatch selftests.  See kernel-build-test.yml.
+  kernel:
     name: kernel ${{ matrix.name }}
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         name: [gcc-11, gcc-13, clang-18]
-    steps:
-      - uses: actions/checkout@v4
-
-      - id: tc
-        uses: ./.github/actions/setup-toolchain
-        with:
-          name: ${{ matrix.name }}
-
-      - name: Cache kernel build output
-        uses: actions/cache@v4
-        with:
-          path: build-${{ matrix.name }}
-          key: kbuild-${{ runner.os }}-${{ matrix.name }}-${{ github.sha }}
-          restore-keys: |
-            kbuild-${{ runner.os }}-${{ matrix.name }}-
-
-      - name: Build kernel
-        run: |
-          make O=build-${{ matrix.name }} ${{ steps.tc.outputs.make_args }} defconfig
-          make O=build-${{ matrix.name }} ${{ steps.tc.outputs.make_args }} -j"$(nproc)"
-
-      - name: Check the kernel used the matrix compiler
-        run: |
-          want='${{ steps.tc.outputs.major }}'
-          cfg=build-${{ matrix.name }}/.config
-          sed -n 's/^CONFIG_CC_VERSION_TEXT=//p' "$cfg"
-          # CONFIG_{GCC,CLANG}_VERSION is major*10000 + minor*100 + patch, and
-          # whichever compiler is not in use reports 0.
-          got=$(sed -n 's/^CONFIG_\(GCC\|CLANG\)_VERSION=\([0-9]\+\)$/\2/p' "$cfg" |
-                sort -rn | head -1)
-          [ "$((got / 10000))" = "$want" ] ||
-            { echo "::error::kernel built with major $((got / 10000)), expected $want"; exit 1; }
-
-      - name: Upload kernel config on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-config-${{ matrix.name }}
-          path: build-${{ matrix.name }}/.config
-          retention-days: 7
-          if-no-files-found: ignore
+    uses: ./.github/workflows/kernel-build-test.yml
+    with:
+      toolchain: ${{ matrix.name }}
